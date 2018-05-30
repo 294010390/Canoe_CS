@@ -1,0 +1,399 @@
+/*@!Encoding:936*/
+includes
+{
+}
+
+variables
+{
+  const long  INVALID_SOCKET =    ~0;
+  const long  WSA_IO_PENDING =   997;
+  const long  WSAEWOULDBLOCK = 10035;
+  const dword INVALID_IP     = 0xffffffff;
+
+  dword       gIpAddress           = INVALID_IP;
+  char        gIpLastErrStr[1024]  = "";
+  char        gIpAddressStr[32]    = "";
+  int         gIpLastErr           = 0;
+
+  dword       gTcpPort          = 0;
+  long        gTcpSocket        = INVALID_SOCKET;
+  long        gTcpDataSocket    = INVALID_SOCKET;
+  char        gTcpRxBuffer[8192];
+  
+  char        a_senddata[2] = "a";
+  char        b_senddata[2] = "b";
+  char        e_senddata[2] = "#"; //退出接收
+  
+  char        Feedback[3] = "OK";
+
+  // status
+  int         gStatus = 0;
+  const int   gkSTATUS_UNINITIALISED = 0;
+  const int   gkSTATUS_INITIALISED   = 1;
+  
+  message 0x123 RVC_messages;
+  
+  msTimer RVC_messages_Timer;
+}
+
+On Timer RVC_messages_Timer
+{
+  output(RVC_messages);
+  setTimer(RVC_messages_Timer,100);
+}
+
+
+void SetupIp()
+{
+  int   adapterIndex;
+  int   ifIdx;
+  int   Idex;
+  int   pos;
+  char  text[512] = "";
+  char  info[512] = "";
+  char  ifDescr[512];
+  int   size = 512;
+  long  result = 0;
+  dword addresses[1];
+
+  writeClear(0);
+
+  if (1 > IpGetAdapterCount())
+  {
+    writelineex(0, 3, "Error: There is no network interface available!");
+    
+    stop();
+  }
+  
+  //获取当前全部网卡设备
+  //获取localhost的index
+  
+  for (ifIdx = 1; ifIdx <= IpGetAdapterCount(); ifIdx++)
+  {
+    result = IpGetAdapterDescription( ifIdx, ifDescr, elcount(ifDescr) );
+    if (result == 0)
+    {
+      // success.
+      //write("IpGetAdapterDescription for adapter %d returned: %s", ifIdx, ifDescr);
+      pos = strstr(ifDescr,"Loopback");
+      if (pos != -1)
+      {
+        adapterIndex = ifIdx;
+      }
+    }
+    else
+    {
+      writeLineEx(1, 3, "IpGetAdapterDescription: Error %d", result);
+    }
+    
+  }
+  
+  if (0 != IpGetAdapterAddress(adapterIndex, addresses, 1))
+  {
+    writelineex(0, 3, "Error: Could not retrieve Ip address!");
+    
+    stop();
+  }
+  
+  gIpAddress = addresses[0]; // the interface used
+
+  if (INVALID_IP == gIpAddress)
+  {
+    writelineex(0, 3, "Error: Ip address to be used is invalid!");
+    
+    stop();
+  }
+ 
+  //打印网络信息
+  IpGetAdapterDescription(adapterIndex, text, size);
+  snprintf(info, size, "Interface: %s", text);
+  writelineex(0, 1, info);
+
+  IpGetAdapterAddressAsString(adapterIndex, text, size);
+  snprintf(info, size, "Ip address: %s", text);
+  writelineex(0, 1, info);
+
+  IpGetAdapterMaskAsString(adapterIndex, text, size);
+  snprintf(info, size, "Subnet mask: %s", text);
+  writelineex(0, 1, info);
+
+  IpGetAdapterGatewayAsString(adapterIndex, text, size);
+  snprintf(info, size, "Gateway address: %s", text);
+  writelineex(0, 1, info);
+ 
+  gStatus = gkSTATUS_INITIALISED;
+}
+
+on start
+{
+  SetupIp();  
+}
+
+on stopMeasurement
+{
+  ResetIp();
+}
+
+void OnTcpListen( dword socket, long result)
+{
+  if (gTcpSocket != socket)
+  {
+    writelineex( 0, 2, "OnTcpListen called for unexpected socket (%d).", socket);
+    
+    return;
+  }
+
+  if ( 0 != result)
+  {
+    IpGetLastSocketErrorAsString( socket, gIpLastErrStr, elcount( gIpLastErrStr));
+
+    writelineex( 0, 2, "OnTcpListen error (%d, %s).", 
+                 IpGetLastSocketError( socket), gIpLastErrStr);
+    return;
+  }
+
+  if (gTcpDataSocket != INVALID_SOCKET)
+  {
+    TcpClose(gTcpDataSocket);
+  }
+  
+  gTcpDataSocket = TcpAccept( socket);
+  writelineex( 0, 1, "Status: Tcp Accept success.");  
+
+  if ( INVALID_SOCKET == gTcpDataSocket)
+  {
+    IpGetLastSocketErrorAsString( socket, gIpLastErrStr, elcount( gIpLastErrStr));
+
+    writelineex( 0, 2, "Error: TcpAccept (%d): %s", 
+                 IpGetLastSocketError( socket), gIpLastErrStr);
+    
+    return;
+  }
+
+  TcpRecv( gTcpDataSocket);
+
+  writelineex( 0, 1, "Status: Tcp connection established.");  
+}
+
+long OnTcpReceive( dword socket, long result, dword address, dword port, char buffer[], dword size)
+{
+  char  addressString[64] = "";
+
+  if ( gTcpDataSocket != socket)
+  {
+    writelineex(0, 2, "OnTcpReceive called for unknown socket 0x%X", socket);
+
+    return 0;
+  }
+
+  if (0 != result)
+  {
+    IpGetLastSocketErrorAsString( socket, gIpLastErrStr, elcount( gIpLastErrStr));
+
+    writelineex( 0, 2, "OnTcpReceive error (%d): %s", IpGetLastSocketError( socket), gIpLastErrStr);
+
+    return 0;
+  }
+ 
+  IpGetAddressAsString(address, addressString, elcount(addressString));
+  //writeLineEx(0,1,"Buffer = %s",buffer);
+  switch(atol(buffer))
+  {
+    case 0: //用于每次清空buufer，不使用0来判断
+      break;
+    case 99:
+      writeLineEx(0,1,"Exit Receive");
+      //SendTcpData("e");
+      break;
+    case 1:
+    {
+      writeLineEx(0,1,"Enter into RVC");
+      EnterRVC();
+      //SendTcpData("OK");
+      break;
+    }
+    case 2:
+    {
+      writeLineEx(0,1,"Exit into RVC");
+      ExitRVC();
+      //SendTcpData("OK");
+      break;
+    }
+    default:
+      writeLineEx(0,1,"others");
+      break;
+  }
+  strncpy (buffer,"0",2);
+  TcpRecv( socket);
+
+  return 0;
+}
+
+void OnTcpSend( dword socket, long result, char buffer[], dword size)
+{
+  if ( gTcpDataSocket != socket)
+  {
+    writelineex(0, 2, "OnTcpSend called for unknown socket 0x%X", socket);
+  }
+
+  if (0 != result)
+  {
+    IpGetLastSocketErrorAsString( socket, gIpLastErrStr, elcount( gIpLastErrStr));
+
+    writelineex( 0, 2, "OnTcpSend error (%d): %s", IpGetLastSocketError( socket), gIpLastErrStr);
+  }
+  else
+  {
+    writelineex( 0, 1, "Tcp data sent successfully!",buffer);
+    
+  }
+}
+
+void StartListenTcp()
+{ 
+  gTcpPort = 9999; //定义Port = 9999
+
+  gTcpSocket = TcpOpen(gIpAddress, gTcpPort);
+
+  if ( INVALID_SOCKET == gTcpSocket)
+  {
+    writelineex(0, 1, "Error: could not create Tcp socket!");
+
+    return;
+  }
+
+  writelineex(0, 1, "Successfully created Tcp socket.");
+  
+  TcpListen(gTcpSocket);
+
+  writelineex( 0, 1, "Listening for incoming Tcp connections on port %d", gTcpPort);
+}
+
+void StopListenTcp()
+{
+  if (INVALID_SOCKET != gTcpDataSocket)
+  {
+    TcpClose(gTcpDataSocket);
+    
+    gTcpDataSocket = INVALID_SOCKET;
+  }
+
+  if (INVALID_SOCKET != gTcpSocket)
+  {
+    TcpClose(gTcpSocket);
+    
+    gTcpSocket = INVALID_SOCKET;
+  }
+
+  writelineex(0, 1, "Tcp socket is closed.");
+}
+
+
+void SendTcpData(char buffer[])
+{
+
+  if (INVALID_SOCKET != gTcpDataSocket)
+
+  if (0 != TcpSend( gTcpDataSocket, buffer, elcount(b_senddata)))
+  {
+    gIpLastErr = IpGetLastSocketError( gTcpDataSocket);
+
+    if ( WSA_IO_PENDING != gIpLastErr)
+    {
+      IpGetLastSocketErrorAsString( gTcpDataSocket, gIpLastErrStr, elcount( gIpLastErrStr));
+
+      writelineex( 0, 2, "TcpSend error (%d): %s", gIpLastErr, gIpLastErrStr);
+    }
+  }
+  else
+  {
+    writelineex( 0, 1, "Tcp data %s sent successfully!",buffer);
+  }
+}
+
+long TcpRecv( dword socket)
+{
+  int result = 0;
+
+  result = TcpReceive( socket, gTcpRxBuffer, elcount( gTcpRxBuffer));
+
+  if ( 0 != result)
+  {
+    gIpLastErr = IpGetLastSocketError( socket);
+
+    if ( WSA_IO_PENDING != gIpLastErr)
+    {
+      IpGetLastSocketErrorAsString( socket, gIpLastErrStr, elcount( gIpLastErrStr));
+
+      writelineex( 0, 2, "TcpReceive error (%d): %s", gIpLastErr, gIpLastErrStr);
+    }
+  }
+
+  return result;
+}
+
+void ResetIp()
+{
+  if (INVALID_SOCKET != gTcpDataSocket)
+  {
+    TcpClose(gTcpDataSocket);
+    
+    gTcpDataSocket = INVALID_SOCKET;
+  }
+
+  if (INVALID_SOCKET != gTcpSocket)
+  {
+    TcpClose(gTcpSocket);
+    
+    gTcpSocket = INVALID_SOCKET;
+  }
+
+}
+
+void EnterRVC()
+{
+  //进入RVC发送的消息
+
+}
+
+void ExitRVC()
+{
+  //退出RVC发送的消息
+
+}
+
+//启动listen()
+on key 'i'
+{
+  int i = 1;
+  int flg;
+  
+  if (i == 1 || flg == 1)
+  {
+    StartListenTcp();
+    flg = 0;
+    i = 0;
+  }
+  else
+  {
+    StopListenTcp();
+    flg = 1;
+  }
+}
+
+//模拟测试发送a/b/c
+On key 'a'
+{
+  SendTcpData(a_senddata);
+}
+
+On key 'b'
+{
+  SendTcpData(b_senddata);
+}
+
+On key 'e'
+{
+  SendTcpData(e_senddata);
+}
+
